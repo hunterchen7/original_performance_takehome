@@ -43,7 +43,7 @@ class KernelBuilder:
         self.const_map = {}
         self.enable_vdebug = False
         self.enable_stats = False
-        self.pipe_buffers_override = 19
+        self.pipe_buffers_override = 13
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -124,24 +124,56 @@ class KernelBuilder:
         node0 = self.alloc_scratch("node0")
         node1 = self.alloc_scratch("node1")
         node2 = self.alloc_scratch("node2")
+        node3 = self.alloc_scratch("node3")
+        node4 = self.alloc_scratch("node4")
+        node5 = self.alloc_scratch("node5")
+        node6 = self.alloc_scratch("node6")
         node0_v = self.alloc_scratch("node0_v", VLEN)
         node1_v = self.alloc_scratch("node1_v", VLEN)
         node2_v = self.alloc_scratch("node2_v", VLEN)
+        node3_v = self.alloc_scratch("node3_v", VLEN)
+        node4_v = self.alloc_scratch("node4_v", VLEN)
+        node5_v = self.alloc_scratch("node5_v", VLEN)
+        node6_v = self.alloc_scratch("node6_v", VLEN)
+        delta34_v = self.alloc_scratch("delta34_v", VLEN)
+        delta56_v = self.alloc_scratch("delta56_v", VLEN)
         forest_base_p1 = self.alloc_scratch("forest_base_p1")
         forest_base_p2 = self.alloc_scratch("forest_base_p2")
+        forest_base_p3 = self.alloc_scratch("forest_base_p3")
+        forest_base_p4 = self.alloc_scratch("forest_base_p4")
+        forest_base_p5 = self.alloc_scratch("forest_base_p5")
+        forest_base_p6 = self.alloc_scratch("forest_base_p6")
         self.add("valu", ("vbroadcast", zero_v, zero_const))
         self.add("valu", ("vbroadcast", one_v, one_const))
         self.add("valu", ("vbroadcast", two_v, two_const))
         self.add("valu", ("vbroadcast", n_nodes_v, self.scratch["n_nodes"]))
         self.add("valu", ("vbroadcast", forest_base_v, self.scratch["forest_values_p"]))
+        three_const = self.scratch_const(3)
+        four_const = self.scratch_const(4)
+        five_const = self.scratch_const(5)
+        six_const = self.scratch_const(6)
         self.add("load", ("load", node0, self.scratch["forest_values_p"]))
         self.add("alu", ("+", forest_base_p1, self.scratch["forest_values_p"], one_const))
         self.add("alu", ("+", forest_base_p2, self.scratch["forest_values_p"], two_const))
+        self.add("alu", ("+", forest_base_p3, self.scratch["forest_values_p"], three_const))
+        self.add("alu", ("+", forest_base_p4, self.scratch["forest_values_p"], four_const))
+        self.add("alu", ("+", forest_base_p5, self.scratch["forest_values_p"], five_const))
+        self.add("alu", ("+", forest_base_p6, self.scratch["forest_values_p"], six_const))
         self.add("load", ("load", node1, forest_base_p1))
         self.add("load", ("load", node2, forest_base_p2))
+        self.add("load", ("load", node3, forest_base_p3))
+        self.add("load", ("load", node4, forest_base_p4))
+        self.add("load", ("load", node5, forest_base_p5))
+        self.add("load", ("load", node6, forest_base_p6))
         self.add("valu", ("vbroadcast", node0_v, node0))
         self.add("valu", ("vbroadcast", node1_v, node1))
         self.add("valu", ("vbroadcast", node2_v, node2))
+        self.add("valu", ("vbroadcast", node3_v, node3))
+        self.add("valu", ("vbroadcast", node4_v, node4))
+        self.add("valu", ("vbroadcast", node5_v, node5))
+        self.add("valu", ("vbroadcast", node6_v, node6))
+        self.add("valu", ("-", delta34_v, node4_v, node3_v))
+        self.add("valu", ("-", delta56_v, node6_v, node5_v))
 
         hash_c1_v = []
         hash_c3_v = []
@@ -185,7 +217,7 @@ class KernelBuilder:
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
 
-        per_buffer = VLEN * 4 + 2
+        per_buffer = VLEN * 6 + 2
         scratch_left = SCRATCH_SIZE - self.scratch_ptr
         max_buffers = scratch_left // per_buffer if scratch_left > 0 else 0
         pipe_buffers = min(vector_blocks, max_buffers) if vector_blocks else 0
@@ -197,6 +229,8 @@ class KernelBuilder:
             val = self.alloc_scratch(f"val_v{bi}", VLEN)
             node = self.alloc_scratch(f"node_val_v{bi}", VLEN)
             addr = self.alloc_scratch(f"addr_v{bi}", VLEN)
+            cond = self.alloc_scratch(f"cond_v{bi}", VLEN)
+            tmp1 = self.alloc_scratch(f"tmp1_v{bi}", VLEN)
             idx_addr = self.alloc_scratch(f"idx_addr{bi}")
             val_addr = self.alloc_scratch(f"val_addr{bi}")
             buffers.append(
@@ -205,9 +239,9 @@ class KernelBuilder:
                     "val": val,
                     "node": node,
                     "addr": addr,
-                    "tmp1": addr,
+                    "tmp1": tmp1,
                     "tmp2": node,
-                    "cond": node,
+                    "cond": cond,
                     "idx_addr": idx_addr,
                     "val_addr": val_addr,
                 }
@@ -280,6 +314,20 @@ class KernelBuilder:
                                     )
                                 )
                                 block["round"] = 1
+                                block["stage"] = 0
+                                block["gather"] = 0
+                                block["next_phase"] = "xor"
+                            elif block["round"] == 1 and rounds > 2:
+                                flow_ops.append(
+                                    (
+                                        "vselect",
+                                        buf["node"],
+                                        buf["cond"],
+                                        buf["tmp1"],
+                                        buf["node"],
+                                    )
+                                )
+                                block["round"] = 2
                                 block["stage"] = 0
                                 block["gather"] = 0
                                 block["next_phase"] = "xor"
@@ -372,11 +420,17 @@ class KernelBuilder:
                     elif phase == "hash_op2":
                         valu_tasks.append((3, 1, block))
                     elif phase == "update1":
-                        valu_tasks.append((4, 2, block))
+                        if block["round"] == 1 and rounds > 2:
+                            valu_tasks.append((4, 3, block))
+                        else:
+                            valu_tasks.append((4, 2, block))
                     elif phase == "update2":
                         valu_tasks.append((5, 1, block))
                     elif phase == "update3":
-                        valu_tasks.append((6, 1, block))
+                        if block["round"] == 1 and rounds > 2:
+                            valu_tasks.append((6, 3, block))
+                        else:
+                            valu_tasks.append((6, 1, block))
 
                 valu_tasks.sort(key=lambda x: x[0])
                 for _prio, cost, block in valu_tasks:
@@ -434,6 +488,8 @@ class KernelBuilder:
                         valu_slots -= 1
                     elif phase == "update1":
                         valu_ops.append(("&", buf["tmp1"], buf["val"], one_v))
+                        if block["round"] == 1 and rounds > 2:
+                            valu_ops.append(("+", buf["addr"], buf["idx"], zero_v))
                         valu_ops.append(
                             (
                                 "multiply_add",
@@ -445,7 +501,10 @@ class KernelBuilder:
                         )
                         block["next_phase"] = "update2"
                         scheduled_main.add(block["block"])
-                        valu_slots -= 2
+                        if block["round"] == 1 and rounds > 2:
+                            valu_slots -= 3
+                        else:
+                            valu_slots -= 2
                     elif phase == "update2":
                         valu_ops.append(("+", buf["idx"], buf["idx"], buf["tmp1"]))
                         block["next_phase"] = "update3"
@@ -454,11 +513,22 @@ class KernelBuilder:
                     elif phase == "update3":
                         if block["round"] == 0 and rounds > 1:
                             valu_ops.append(("+", buf["cond"], buf["tmp1"], zero_v))
+                        elif block["round"] == 1 and rounds > 2:
+                            valu_ops.append(("&", buf["cond"], buf["addr"], one_v))
+                            valu_ops.append(
+                                ("multiply_add", buf["node"], buf["tmp1"], delta56_v, node5_v)
+                            )
+                            valu_ops.append(
+                                ("multiply_add", buf["tmp1"], buf["tmp1"], delta34_v, node3_v)
+                            )
                         else:
                             valu_ops.append(("<", buf["cond"], buf["idx"], n_nodes_v))
                         block["next_phase"] = "update5"
                         scheduled_main.add(block["block"])
-                        valu_slots -= 1
+                        if block["round"] == 1 and rounds > 2:
+                            valu_slots -= 3
+                        else:
+                            valu_slots -= 1
                     elif phase == "addr":
                         valu_ops.append(("+", buf["addr"], buf["idx"], forest_base_v))
                         block["next_phase"] = "gather"

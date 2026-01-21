@@ -58,3 +58,18 @@ Files changed:
 Test results:
 - `python3 perf_takehome.py Tests.test_kernel_cycles` -> CYCLES: 2119
 - `python3 tests/submission_tests.py` -> FAIL (stricter thresholds), CYCLES: 2119
+
+## Iteration 5
+
+Summary:
+- Added round-2 prefetch by selecting nodes 3..6 from broadcasted scalars using `idx1` and `val & 1`, skipping round-2 gather.
+- Stored `idx1` in a dedicated vector temp on round 1 and used arithmetic selection (multiply_add) to build the next node value.
+- Added node3..node6 scalar loads, vector broadcasts, and deltas for fast two-way blends.
+- Rebalanced scratch buffers and tuned pipeline depth to `pipe_buffers=13`.
+
+Files changed:
+- perf_takehome.py
+
+Test results:
+- `python3 perf_takehome.py Tests.test_kernel_cycles` -> CYCLES: 2020
+- `python3 tests/submission_tests.py` -> FAIL (stricter thresholds), CYCLES: 2020
