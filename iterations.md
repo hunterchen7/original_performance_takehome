@@ -13,3 +13,17 @@ Files changed:
 
 Test results:
 - `python3 perf_takehome.py Tests.test_kernel_cycles` -> CYCLES: 21041
+
+## Iteration 2
+
+Summary:
+- Added VLIW bundle emission to pack ALU/VALU/LOAD/STORE/FLOW slots per cycle.
+- Double-buffered vector registers and pipelined next-block prefetch (address calc, vload, gather) during current block hashing.
+- Simplified vector idx update using bitwise step (`1 + (val & 1)`) and overlapped val store with update.
+- Added optional vector debug via `vcompare` gated by `KernelBuilder.enable_vdebug`.
+
+Files changed:
+- perf_takehome.py
+
+Test results:
+- `python3 perf_takehome.py Tests.test_kernel_cycles` -> CYCLES: 9918
