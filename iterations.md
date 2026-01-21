@@ -43,3 +43,18 @@ Files changed:
 Test results:
 - `python3 perf_takehome.py Tests.test_kernel_cycles` -> CYCLES: 2292
 - `python3 tests/submission_tests.py` -> FAIL (speed thresholds), CYCLES: 2292
+
+## Iteration 4
+
+Summary:
+- Special-cased round 0 to skip gather by XORing with a broadcasted `forest_values[0]`.
+- Prefetched round 1 node values using `val & 1` in round 0 update5 to skip round 1 gather/addr.
+- Added node0/node1/node2 scalar loads and vector broadcasts for early-round fast paths.
+- Tuned pipeline depth to `pipe_buffers=19` for the new schedule.
+
+Files changed:
+- perf_takehome.py
+
+Test results:
+- `python3 perf_takehome.py Tests.test_kernel_cycles` -> CYCLES: 2119
+- `python3 tests/submission_tests.py` -> FAIL (stricter thresholds), CYCLES: 2119
