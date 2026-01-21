@@ -127,7 +127,8 @@ class KernelBuilder:
 
         hash_c1_v = []
         hash_c3_v = []
-        for hi, (_op1, val1, _op2, _op3, val3) in enumerate(HASH_STAGES):
+        hash_mul_v = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1_scalar = self.scratch_const(val1)
             c1_v = self.alloc_scratch(f"hash_c1_v_{hi}", VLEN)
             self.add("valu", ("vbroadcast", c1_v, c1_scalar))
@@ -136,6 +137,13 @@ class KernelBuilder:
             self.add("valu", ("vbroadcast", c3_v, c3_scalar))
             hash_c1_v.append(c1_v)
             hash_c3_v.append(c3_v)
+            mul_v = None
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                mul = (1 + (1 << val3)) % (2**32)
+                mul_scalar = self.scratch_const(mul)
+                mul_v = self.alloc_scratch(f"hash_mul_v_{hi}", VLEN)
+                self.add("valu", ("vbroadcast", mul_v, mul_scalar))
+            hash_mul_v.append(mul_v)
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
@@ -146,37 +154,12 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting loop"))
         body_instrs = []
 
-        def emit_bundle(alu=None, valu=None, load=None, store=None, flow=None, debug=None):
-            instr = {}
-            if alu:
-                instr["alu"] = alu
-            if valu:
-                instr["valu"] = valu
-            if load:
-                instr["load"] = load
-            if store:
-                instr["store"] = store
-            if flow:
-                instr["flow"] = flow
-            if debug:
-                instr["debug"] = debug
-            if not instr:
-                return
-            for name, slots in instr.items():
-                assert len(slots) <= SLOT_LIMITS[name]
-            body_instrs.append(instr)
-
-        def vkeys(round_i, base_i, name):
-            return [(round_i, base_i + lane, name) for lane in range(VLEN)]
-
-        def emit_vcompare(vec_addr, keys):
-            if not self.enable_vdebug:
-                return
-            emit_bundle(debug=[("vcompare", vec_addr, keys)])
-
-        # Vector scratch registers (double-buffered)
+        # Vector scratch registers (pipelined buffers)
         buffers = []
-        for bi in range(2):
+        vector_batch = (batch_size // VLEN) * VLEN
+        vector_blocks = vector_batch // VLEN
+        pipe_buffers = min(20, vector_blocks) if vector_blocks else 0
+        for bi in range(pipe_buffers):
             buffers.append(
                 {
                     "idx": self.alloc_scratch(f"idx_v{bi}", VLEN),
@@ -197,127 +180,266 @@ class KernelBuilder:
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
 
-        vector_batch = (batch_size // VLEN) * VLEN
-        vector_blocks = vector_batch // VLEN
         block_offsets = [self.scratch_const(i) for i in range(0, vector_batch, VLEN)]
 
-        def prefetch_ops(next_buf, next_offset, cycle_idx):
-            ops = {"alu": [], "valu": [], "load": []}
-            if next_buf is None:
-                return ops
-            if cycle_idx == 0:
-                ops["alu"].append(
-                    ("+", next_buf["idx_addr"], self.scratch["inp_indices_p"], next_offset)
-                )
-                ops["alu"].append(
-                    ("+", next_buf["val_addr"], self.scratch["inp_values_p"], next_offset)
-                )
-            elif cycle_idx == 1:
-                ops["load"].append(("vload", next_buf["idx"], next_buf["idx_addr"]))
-                ops["load"].append(("vload", next_buf["val"], next_buf["val_addr"]))
-            elif cycle_idx == 2:
-                ops["valu"].append(("+", next_buf["addr"], next_buf["idx"], forest_base_v))
-            elif 3 <= cycle_idx <= 6:
-                lane = (cycle_idx - 3) * 2
-                ops["load"].append(("load_offset", next_buf["node"], next_buf["addr"], lane))
-                ops["load"].append(
-                    ("load_offset", next_buf["node"], next_buf["addr"], lane + 1)
-                )
-            return ops
+        def schedule_all_rounds():
+            if vector_blocks == 0:
+                return []
+            instrs = []
+            active = []
+            free_bufs = list(range(pipe_buffers))
+            next_block = 0
 
+            def start_block():
+                nonlocal next_block
+                if next_block >= vector_blocks or not free_bufs:
+                    return False
+                buf_idx = free_bufs.pop(0)
+                active.append(
+                    {
+                        "block": next_block,
+                        "buf_idx": buf_idx,
+                        "buf": buffers[buf_idx],
+                        "offset": block_offsets[next_block],
+                        "phase": "init_addr",
+                        "round": 0,
+                        "stage": 0,
+                        "gather": 0,
+                    }
+                )
+                next_block += 1
+                return True
+
+            while free_bufs and next_block < vector_blocks:
+                start_block()
+
+            while active or next_block < vector_blocks:
+                while free_bufs and next_block < vector_blocks:
+                    start_block()
+
+                alu_ops = []
+                load_ops = []
+                valu_ops = []
+                store_ops = []
+                flow_ops = []
+
+                alu_slots = SLOT_LIMITS["alu"]
+                load_slots = SLOT_LIMITS["load"]
+                valu_slots = SLOT_LIMITS["valu"]
+                store_slots = SLOT_LIMITS["store"]
+                flow_slots = SLOT_LIMITS["flow"]
+
+                scheduled_main = set()
+
+                # Flow: vselect for bounds
+                if flow_slots:
+                    for block in active:
+                        if block["phase"] == "update5":
+                            buf = block["buf"]
+                            flow_ops.append(
+                                ("vselect", buf["idx"], buf["cond"], buf["idx"], zero_v)
+                            )
+                            if block["round"] + 1 < rounds:
+                                block["round"] += 1
+                                block["stage"] = 0
+                                block["gather"] = 0
+                                block["next_phase"] = "addr"
+                            else:
+                                block["next_phase"] = "store_val"
+                            scheduled_main.add(block["block"])
+                            flow_slots -= 1
+                            break
+
+                # Store val after the final round completes
+                for block in active:
+                    if store_slots == 0:
+                        break
+                    if block["phase"] == "store_val" and block["block"] not in scheduled_main:
+                        buf = block["buf"]
+                        store_ops.append(("vstore", buf["val_addr"], buf["val"]))
+                        block["next_phase"] = "store_idx"
+                        scheduled_main.add(block["block"])
+                        store_slots -= 1
+
+                # Store idx after val is stored (finishes blocks)
+                for block in active:
+                    if store_slots == 0:
+                        break
+                    if block["phase"] == "store_idx" and block["block"] not in scheduled_main:
+                        buf = block["buf"]
+                        store_ops.append(("vstore", buf["idx_addr"], buf["idx"]))
+                        block["next_phase"] = "done"
+                        scheduled_main.add(block["block"])
+                        store_slots -= 1
+
+                # Loads: prioritize vload to feed the pipeline
+                if load_slots >= 2:
+                    for block in active:
+                        if block["phase"] == "vload" and block["block"] not in scheduled_main:
+                            buf = block["buf"]
+                            load_ops.append(("vload", buf["idx"], buf["idx_addr"]))
+                            load_ops.append(("vload", buf["val"], buf["val_addr"]))
+                            block["next_phase"] = "addr"
+                            scheduled_main.add(block["block"])
+                            load_slots -= 2
+                            break
+
+                # Loads: gather node values
+                for block in active:
+                    if load_slots == 0:
+                        break
+                    if block["phase"] == "gather" and block["block"] not in scheduled_main:
+                        buf = block["buf"]
+                        for _ in range(load_slots):
+                            lane = block["gather"]
+                            if lane >= VLEN:
+                                break
+                            load_ops.append(("load_offset", buf["node"], buf["addr"], lane))
+                            block["gather"] += 1
+                            load_slots -= 1
+                            if load_slots == 0:
+                                break
+                        if block["gather"] >= VLEN:
+                            block["next_phase"] = "xor"
+                            scheduled_main.add(block["block"])
+
+                # VALU tasks with priorities
+                valu_tasks = []
+                for block in active:
+                    if block["block"] in scheduled_main:
+                        continue
+                    phase = block["phase"]
+                    if phase == "hash_op13":
+                        stage = block["stage"]
+                        cost = 1 if hash_mul_v[stage] is not None else 2
+                        valu_tasks.append((0, cost, block))
+                    elif phase == "hash_op2":
+                        valu_tasks.append((1, 1, block))
+                    elif phase == "xor":
+                        valu_tasks.append((2, 1, block))
+                    elif phase == "update1":
+                        valu_tasks.append((3, 2, block))
+                    elif phase == "update2":
+                        valu_tasks.append((4, 1, block))
+                    elif phase == "update3":
+                        valu_tasks.append((5, 1, block))
+                    elif phase == "addr":
+                        valu_tasks.append((6, 1, block))
+
+                valu_tasks.sort(key=lambda x: x[0])
+                for _prio, cost, block in valu_tasks:
+                    if valu_slots < cost:
+                        continue
+                    if block["block"] in scheduled_main:
+                        continue
+                    buf = block["buf"]
+                    phase = block["phase"]
+                    if phase == "hash_op2":
+                        hi = block["stage"]
+                        op2 = HASH_STAGES[hi][2]
+                        valu_ops.append((op2, buf["val"], buf["tmp1"], buf["tmp2"]))
+                        if hi + 1 == len(HASH_STAGES):
+                            block["next_phase"] = "update1"
+                        else:
+                            block["stage"] = hi + 1
+                            block["next_phase"] = "hash_op13"
+                        scheduled_main.add(block["block"])
+                        valu_slots -= 1
+                    elif phase == "hash_op13":
+                        hi = block["stage"]
+                        mul_v = hash_mul_v[hi]
+                        if mul_v is not None:
+                            valu_ops.append(
+                                ("multiply_add", buf["val"], buf["val"], mul_v, hash_c1_v[hi])
+                            )
+                            if hi + 1 == len(HASH_STAGES):
+                                block["next_phase"] = "update1"
+                            else:
+                                block["stage"] = hi + 1
+                                block["next_phase"] = "hash_op13"
+                            scheduled_main.add(block["block"])
+                            valu_slots -= 1
+                        else:
+                            op1 = HASH_STAGES[hi][0]
+                            op3 = HASH_STAGES[hi][3]
+                            valu_ops.append((op1, buf["tmp1"], buf["val"], hash_c1_v[hi]))
+                            valu_ops.append((op3, buf["tmp2"], buf["val"], hash_c3_v[hi]))
+                            block["next_phase"] = "hash_op2"
+                            scheduled_main.add(block["block"])
+                            valu_slots -= 2
+                    elif phase == "xor":
+                        valu_ops.append(("^", buf["val"], buf["val"], buf["node"]))
+                        block["next_phase"] = "hash_op13"
+                        scheduled_main.add(block["block"])
+                        valu_slots -= 1
+                    elif phase == "update1":
+                        valu_ops.append(("&", buf["tmp1"], buf["val"], one_v))
+                        valu_ops.append(
+                            ("multiply_add", buf["idx"], buf["idx"], two_v, one_v)
+                        )
+                        block["next_phase"] = "update2"
+                        scheduled_main.add(block["block"])
+                        valu_slots -= 2
+                    elif phase == "update2":
+                        valu_ops.append(("+", buf["idx"], buf["idx"], buf["tmp1"]))
+                        block["next_phase"] = "update3"
+                        scheduled_main.add(block["block"])
+                        valu_slots -= 1
+                    elif phase == "update3":
+                        valu_ops.append(("<", buf["cond"], buf["idx"], n_nodes_v))
+                        block["next_phase"] = "update5"
+                        scheduled_main.add(block["block"])
+                        valu_slots -= 1
+                    elif phase == "addr":
+                        valu_ops.append(("+", buf["addr"], buf["idx"], forest_base_v))
+                        block["next_phase"] = "gather"
+                        scheduled_main.add(block["block"])
+                        valu_slots -= 1
+
+                # ALU tasks: compute base addresses once per block
+                for block in active:
+                    if alu_slots < 2:
+                        break
+                    if block["phase"] == "init_addr" and block["block"] not in scheduled_main:
+                        buf = block["buf"]
+                        alu_ops.append(("+", buf["idx_addr"], self.scratch["inp_indices_p"], block["offset"]))
+                        alu_ops.append(("+", buf["val_addr"], self.scratch["inp_values_p"], block["offset"]))
+                        block["next_phase"] = "vload"
+                        scheduled_main.add(block["block"])
+                        alu_slots -= 2
+
+                if not (alu_ops or load_ops or valu_ops or store_ops or flow_ops):
+                    raise RuntimeError("scheduler made no progress")
+
+                instr = {}
+                if alu_ops:
+                    instr["alu"] = alu_ops
+                if load_ops:
+                    instr["load"] = load_ops
+                if valu_ops:
+                    instr["valu"] = valu_ops
+                if store_ops:
+                    instr["store"] = store_ops
+                if flow_ops:
+                    instr["flow"] = flow_ops
+                instrs.append(instr)
+
+                # Apply state transitions
+                new_active = []
+                for block in active:
+                    next_phase = block.pop("next_phase", None)
+                    if next_phase:
+                        block["phase"] = next_phase
+                    if block["phase"] == "done":
+                        free_bufs.append(block["buf_idx"])
+                    else:
+                        new_active.append(block)
+                active = new_active
+
+            return instrs
+
+        body_instrs.extend(schedule_all_rounds())
         for round_i in range(rounds):
-            if vector_blocks:
-                # Prologue: prefetch block 0 into buffer 0
-                buf0 = buffers[0]
-                emit_bundle(
-                    alu=[
-                        (
-                            "+",
-                            buf0["idx_addr"],
-                            self.scratch["inp_indices_p"],
-                            block_offsets[0],
-                        ),
-                        (
-                            "+",
-                            buf0["val_addr"],
-                            self.scratch["inp_values_p"],
-                            block_offsets[0],
-                        ),
-                    ]
-                )
-                emit_bundle(
-                    load=[
-                        ("vload", buf0["idx"], buf0["idx_addr"]),
-                        ("vload", buf0["val"], buf0["val_addr"]),
-                    ]
-                )
-                emit_bundle(valu=[("+", buf0["addr"], buf0["idx"], forest_base_v)])
-                for lane in range(0, VLEN, 2):
-                    emit_bundle(
-                        load=[
-                            ("load_offset", buf0["node"], buf0["addr"], lane),
-                            ("load_offset", buf0["node"], buf0["addr"], lane + 1),
-                        ]
-                    )
-
-                for block in range(vector_blocks):
-                    cur = buffers[block % 2]
-                    next_block = block + 1
-                    next_buf = buffers[next_block % 2] if next_block < vector_blocks else None
-                    next_offset = (
-                        block_offsets[next_block] if next_block < vector_blocks else None
-                    )
-                    base_i = block * VLEN
-
-                    # XOR with node values before hashing, while scheduling prefetch
-                    pre = prefetch_ops(next_buf, next_offset, 0)
-                    emit_bundle(
-                        alu=pre["alu"],
-                        load=pre["load"],
-                        valu=[("^", cur["val"], cur["val"], cur["node"])] + pre["valu"],
-                    )
-
-                    cycle_idx = 1
-                    for hi, (op1, _val1, op2, op3, _val3) in enumerate(HASH_STAGES):
-                        pre = prefetch_ops(next_buf, next_offset, cycle_idx)
-                        emit_bundle(
-                            alu=pre["alu"],
-                            load=pre["load"],
-                            valu=[
-                                (op1, cur["tmp1"], cur["val"], hash_c1_v[hi]),
-                                (op3, cur["tmp2"], cur["val"], hash_c3_v[hi]),
-                            ]
-                            + pre["valu"],
-                        )
-                        cycle_idx += 1
-
-                        pre = prefetch_ops(next_buf, next_offset, cycle_idx)
-                        emit_bundle(
-                            alu=pre["alu"],
-                            load=pre["load"],
-                            valu=[(op2, cur["val"], cur["tmp1"], cur["tmp2"])]
-                            + pre["valu"],
-                        )
-                        cycle_idx += 1
-
-                    emit_vcompare(cur["val"], vkeys(round_i, base_i, "hashed_val"))
-
-                    # idx_v = 2*idx_v + (1 + (val_v & 1))
-                    emit_bundle(
-                        valu=[
-                            ("&", cur["tmp1"], cur["val"], one_v),
-                            ("*", cur["idx"], cur["idx"], two_v),
-                        ],
-                        store=[("vstore", cur["val_addr"], cur["val"])],
-                    )
-                    emit_bundle(valu=[("+", cur["tmp1"], cur["tmp1"], one_v)])
-                    emit_bundle(valu=[("+", cur["idx"], cur["idx"], cur["tmp1"])])
-                    emit_bundle(valu=[("<", cur["cond"], cur["idx"], n_nodes_v)])
-                    emit_bundle(flow=[("vselect", cur["idx"], cur["cond"], cur["idx"], zero_v)])
-                    emit_bundle(store=[("vstore", cur["idx_addr"], cur["idx"])])
-
-                    emit_vcompare(cur["idx"], vkeys(round_i, base_i, "wrapped_idx"))
-
             # Scalar tail for any remaining elements
             for i in range(vector_batch, batch_size):
                 tail_slots = []

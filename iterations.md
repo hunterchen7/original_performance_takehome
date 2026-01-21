@@ -27,3 +27,19 @@ Files changed:
 
 Test results:
 - `python3 perf_takehome.py Tests.test_kernel_cycles` -> CYCLES: 9918
+
+## Iteration 3
+
+Summary:
+- Replaced the hand-written pipeline with a dynamic VLIW scheduler that keeps multiple vector blocks in flight and packs ALU/VALU/LOAD/STORE/FLOW per cycle.
+- Kept `idx`/`val` in scratch across all rounds (single initial vload, final stores only) to cut per-round memory traffic.
+- Simplified idx update to `idx = idx*2 + 1 + (val & 1)` using `multiply_add` to reduce update ops.
+- Fused hash stages where `val = (val + c1) + (val << k)` into a single `multiply_add` using precomputed multipliers.
+- Tuned pipeline depth (`pipe_buffers=20`) to balance throughput and scratch usage.
+
+Files changed:
+- perf_takehome.py
+
+Test results:
+- `python3 perf_takehome.py Tests.test_kernel_cycles` -> CYCLES: 2292
+- `python3 tests/submission_tests.py` -> FAIL (speed thresholds), CYCLES: 2292
